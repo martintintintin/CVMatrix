@@ -9,10 +9,14 @@ Author: Ole-Christian Galbo Engstrøm
 E-mail: ole.e@di.ku.dk
 """
 
+from multiprocessing.managers import SyncManager, SharedMemoryManager
+from multiprocessing.shared_memory import SharedMemory
 from typing import Hashable, Iterable, Union
+from multiprocessing import Array, Manager, Value
 
 import numpy as np
 from numpy import typing as npt
+import time as pytime
 
 
 class CVMatrix:
@@ -70,15 +74,15 @@ class CVMatrix:
     """
 
     def __init__(
-            self,
-            cv_splits: Iterable[Hashable],
-            center_X: bool = True,
-            center_Y: bool = True,
-            scale_X: bool = True,
-            scale_Y: bool = True,
-            dtype: np.floating = np.float64,
-            copy: bool = True,
-        ) -> None:
+        self,
+        cv_splits: Iterable[Hashable],
+        center_X: bool = True,
+        center_Y: bool = True,
+        scale_X: bool = True,
+        scale_Y: bool = True,
+        dtype: np.floating = np.float64,
+        copy: bool = True,
+    ) -> None:
         self.center_X = center_X
         self.center_Y = center_Y
         self.scale_X = scale_X
@@ -101,6 +105,100 @@ class CVMatrix:
         self.val_folds_dict = None
         self._init_val_folds_dict(cv_splits)
 
+    def export_to_multiprocessing_types(
+        self, manager: SyncManager, smm: SharedMemoryManager
+    ):
+        typecode_map = {int: "i", float: "d", bool: "b", str: "s"}
+        managed_values = {}
+        shared_memory_objects = {}  # Store the SharedMemory objects
+        for attr, value in self.__dict__.items():
+            if attr == "val_folds_dict":
+                continue
+                pure_dict = {}
+                for k, v in value.items():
+                    if isinstance(v, np.ndarray):
+                        shm = smm.SharedMemory(size=v.nbytes)
+                        np_array = np.ndarray(v.shape, dtype=v.dtype, buffer=shm.buf)
+                        np_array[:] = v[:]
+                        pure_dict[k] = (v.shape, v.dtype)
+                        shared_memory_objects[k] = shm
+                    else:
+                        assert False
+                managed_values[attr] = manager.dict(pure_dict)
+            elif isinstance(value, np.ndarray):
+                shm = smm.SharedMemory(size=value.nbytes)
+                np_array = np.ndarray(value.shape, dtype=value.dtype, buffer=shm.buf)
+                np_array[:] = value[:]
+                managed_values[attr] = (value.shape, value.dtype)
+                shared_memory_objects[attr] = shm
+            elif isinstance(value, bool):
+                managed_values[attr] = manager.Value("b", int(value))
+            elif np.issubdtype(type(value), np.dtype):
+                managed_values[attr] = manager.Value(str, str(value))
+            elif isinstance(value, dict):
+                managed_values[attr] = manager.dict(value)
+            else:
+                typecode = typecode_map.get(type(value))
+                if typecode is not None:
+                    managed_values[attr] = manager.Value(typecode, value)
+                else:
+                    assert True
+        return managed_values, shared_memory_objects
+
+    @staticmethod
+    def create_from_multiprocessing_types(
+        managed_values, shared_memory_names, cv_splits
+    ):
+        new_instance = CVMatrix(cv_splits=cv_splits)
+        shm_objects = []  # Don't want these garbage collected
+        time_spent_attr = {}
+        for attr, mp_type in reversed(managed_values.items()):
+            start_attr_time = pytime.time()
+            if attr == "val_folds_dict":
+                continue
+                val_folds_dict = {}
+                for k, v in dict(mp_type).items():
+                    if isinstance(v, tuple):
+                        shm = SharedMemory(shared_memory_names[k])
+                        shm_objects.append(shm)
+                        array = np.ndarray(v[0], dtype=v[1], buffer=shm.buf[:])
+                        val_folds_dict[k] = array
+                    else:
+                        assert False
+                setattr(new_instance, attr, val_folds_dict)
+            elif isinstance(mp_type, tuple):
+                if attr in shared_memory_names:
+                    shm = SharedMemory(shared_memory_names[attr])
+                    shm_objects.append(shm)
+                    array = np.ndarray(mp_type[0], dtype=mp_type[1], buffer=shm.buf[:])
+                    setattr(new_instance, attr, array)
+                else:
+                    assert False
+            elif hasattr(mp_type, "_typecode"):
+                if mp_type._typecode == "b":
+                    setattr(new_instance, attr, bool(mp_type.value))
+                elif mp_type._typecode == "i":
+                    setattr(new_instance, attr, int(mp_type.value))
+                elif mp_type._typecode == "d":
+                    setattr(new_instance, attr, float(mp_type.value))
+                elif mp_type._typecode == "s":
+                    setattr(new_instance, attr, str(mp_type.value))
+            else:
+                setattr(new_instance, attr, mp_type.value)
+
+            end_attr_time = pytime.time()
+            time_spent_attr[attr] = end_attr_time - start_attr_time
+
+        # sort time_spent_attr[attr] by max
+        time_spent_attr = dict(
+            sorted(time_spent_attr.items(), key=lambda x: x[1], reverse=True)
+        )
+        worst_two_time_spent = list(time_spent_attr.keys())[:2]
+        worst = {k: time_spent_attr[k] for k in worst_two_time_spent}
+        # print(f"Time spent on worst two attributes: {worst}")
+
+        return new_instance, shm_objects
+
     def fit(self, X: npt.ArrayLike, Y: Union[None, npt.ArrayLike] = None) -> None:
         """
         Loads and stores `X` and `Y` for cross-validation. Computes dataset-wide
@@ -113,7 +211,7 @@ class CVMatrix:
         ----------
         X : Array-like of shape (N, K) or (N,)
             Predictor variables for the entire dataset.
-        
+
         Y : None or array-like of shape (N, M) or (N,), optional, default=None
             Response variables for the entire dataset. If `None`, subsequent calls to
             training_XTY and training_XTX_XTY will raise a `ValueError`.
@@ -216,7 +314,7 @@ class CVMatrix:
         tuple of arrays of shapes (K, K) and (K, M)
             The training set :math:`\mathbf{X}^{\mathbf{T}}\mathbf{X}` and
             :math:`\mathbf{X}^{\mathbf{T}}\mathbf{Y}`.
-        
+
         Raises
         ------
         ValueError
@@ -236,11 +334,8 @@ class CVMatrix:
         return self._training_matrices(True, True, val_fold)
 
     def _training_matrices(
-            self,
-            return_XTX: bool,
-            return_XTY: bool,
-            val_fold: Hashable
-        ) -> Union[np.ndarray, tuple[np.ndarray, np.ndarray]]:
+        self, return_XTX: bool, return_XTY: bool, val_fold: Hashable
+    ) -> Union[np.ndarray, tuple[np.ndarray, np.ndarray]]:
         """
         Returns the training set :math:`\mathbf{X}^{\mathbf{T}}\mathbf{X}` and/or
         :math:`\mathbf{X}^{\mathbf{T}}\mathbf{Y}` corresponding to every sample except
@@ -266,7 +361,7 @@ class CVMatrix:
         Array of shape (K, K) or (K, M) or tuple of arrays of shapes (K, K) and (K, M)
             The training set :math:`\mathbf{X}^{\mathbf{T}}\mathbf{X}` and/or
             training set :math:`\mathbf{X}^{\mathbf{T}}\mathbf{Y}`.
-        
+
         Raises
         ------
         ValueError
@@ -302,33 +397,19 @@ class CVMatrix:
             N_val_over_N_train = N_val / N_train
         if self.center_X or self.center_Y or self.scale_X:
             X_train_mean = self._compute_training_mat_mean(
-                X_val,
-                self.X_total_mean,
-                N_total_over_N_train,
-                N_val_over_N_train
+                X_val, self.X_total_mean, N_total_over_N_train, N_val_over_N_train
             )
         if return_XTY and (self.center_X or self.center_Y or self.scale_Y):
             Y_train_mean = self._compute_training_mat_mean(
-                Y_val,
-                self.Y_total_mean,
-                N_total_over_N_train,
-                N_val_over_N_train
+                Y_val, self.Y_total_mean, N_total_over_N_train, N_val_over_N_train
             )
         if self.scale_X:
             X_train_std = self._compute_training_mat_std(
-                X_val,
-                X_train_mean,
-                self.sum_X_total,
-                self.sum_sq_X_total,
-                N_train
+                X_val, X_train_mean, self.sum_X_total, self.sum_sq_X_total, N_train
             )
         if self.scale_Y and return_XTY:
             Y_train_std = self._compute_training_mat_std(
-                Y_val,
-                Y_train_mean,
-                self.sum_Y_total,
-                self.sum_sq_Y_total,
-                N_train
+                Y_val, Y_train_mean, self.sum_Y_total, self.sum_sq_Y_total, N_train
             )
         if return_XTX and return_XTY:
             return (
@@ -341,7 +422,7 @@ class CVMatrix:
                     X_train_std,
                     X_train_std,
                     N_train,
-                    center=self.center_X
+                    center=self.center_X,
                 ),
                 self._training_kernel_matrix(
                     self.XTY_total,
@@ -352,8 +433,8 @@ class CVMatrix:
                     X_train_std,
                     Y_train_std,
                     N_train,
-                    center=self.center_X or self.center_Y
-                )
+                    center=self.center_X or self.center_Y,
+                ),
             )
         if return_XTX:
             return self._training_kernel_matrix(
@@ -365,7 +446,7 @@ class CVMatrix:
                 X_train_std,
                 X_train_std,
                 N_train,
-                center=self.center_X
+                center=self.center_X,
             )
         return self._training_kernel_matrix(
             self.XTY_total,
@@ -376,21 +457,21 @@ class CVMatrix:
             X_train_std,
             Y_train_std,
             N_train,
-            center=self.center_X or self.center_Y
+            center=self.center_X or self.center_Y,
         )
 
     def _training_kernel_matrix(
-            self,
-            total_kernel_mat: np.ndarray,
-            X_val: np.ndarray,
-            mat2_val: np.ndarray,
-            X_train_mean: Union[None, np.ndarray] = None,
-            mat2_train_mean: Union[None, np.ndarray] = None,
-            X_train_std: Union[None, np.ndarray] = None,
-            mat2_train_std: Union[None, np.ndarray] = None,
-            N_train: Union[None, int] = None,
-            center: bool = False,
-        ) -> np.ndarray:
+        self,
+        total_kernel_mat: np.ndarray,
+        X_val: np.ndarray,
+        mat2_val: np.ndarray,
+        X_train_mean: Union[None, np.ndarray] = None,
+        mat2_train_mean: Union[None, np.ndarray] = None,
+        X_train_std: Union[None, np.ndarray] = None,
+        mat2_train_std: Union[None, np.ndarray] = None,
+        N_train: Union[None, int] = None,
+        center: bool = False,
+    ) -> np.ndarray:
         """
         Computes the training set kernel matrix for a given fold.
 
@@ -402,7 +483,7 @@ class CVMatrix:
 
         X_val : Array of shape (N_val, K)
             The validation set of predictor variables.
-        
+
         mat2_val : Array of shape (N_val, K) or (N_val, M)
             The validation set of predictor or resoponse variables.
 
@@ -425,7 +506,7 @@ class CVMatrix:
         N_train : None or int, optional, default=None
             The size of the training set. Only required if `X_train_mean` or
             `mat2_train_mean` is not `None`.
-        
+
         center : bool, optional, default=False
             Whether to center the kernel matrix. If `True`, the kernel matrix is
             centered. Setting this parameter to `True` requires that `X_train_mean` and
@@ -448,12 +529,12 @@ class CVMatrix:
         return XTmat2_train
 
     def _compute_training_mat_mean(
-            self,
-            mat_val: np.ndarray,
-            mat_total_mean: np.ndarray,
-            N_total_over_N_train: float,
-            N_val_over_N_train: float
-        ) -> np.ndarray:
+        self,
+        mat_val: np.ndarray,
+        mat_total_mean: np.ndarray,
+        N_total_over_N_train: float,
+        N_val_over_N_train: float,
+    ) -> np.ndarray:
         """
         Computes the row of column-wise means of a matrix for a given fold.
 
@@ -461,14 +542,14 @@ class CVMatrix:
         ----------
         mat_val : Array of shape (N_val, K) or (N_val, M)
             The validation set of `X` or `Y`.
-        
+
         mat_total_mean : Array of shape (1, K) or (1, M)
             The row of column-wise means of the total matrix.
-        
+
         N_total_over_N_train : float
             The ratio of the total number of samples to the number of samples in the
             training set.
-        
+
         N_val_over_N_train : float
             The ratio of the number of samples in the validation set to the number of
             samples in the training set.
@@ -484,13 +565,13 @@ class CVMatrix:
         )
 
     def _compute_training_mat_std(
-            self,
-            mat_val: np.ndarray,
-            mat_train_mean: np.ndarray,
-            sum_mat_total: np.ndarray,
-            sum_sq_mat_total: np.ndarray,
-            N_train: int
-        ) -> np.ndarray:
+        self,
+        mat_val: np.ndarray,
+        mat_train_mean: np.ndarray,
+        sum_mat_total: np.ndarray,
+        sum_sq_mat_total: np.ndarray,
+        N_train: int,
+    ) -> np.ndarray:
         """
         Computes the row of column-wise standard deviations of a matrix for a given
         fold.
@@ -528,8 +609,7 @@ class CVMatrix:
             / (N_train - 1)
             * (
                 -2 * mat_train_mean * train_sum_mat
-                + N_train
-                * np.einsum("ij,ij -> ij", mat_train_mean, mat_train_mean)
+                + N_train * np.einsum("ij,ij -> ij", mat_train_mean, mat_train_mean)
                 + train_sum_sq_mat
             )
         )
@@ -567,9 +647,8 @@ class CVMatrix:
         else:
             self.X_total_mean = None
         if (
-            (self.center_X or self.center_Y or self.scale_Y)
-            and self.Y_total is not None
-        ):
+            self.center_X or self.center_Y or self.scale_Y
+        ) and self.Y_total is not None:
             self.Y_total_mean = self.Y_total.mean(axis=0, keepdims=True)
         else:
             self.Y_total_mean = None
